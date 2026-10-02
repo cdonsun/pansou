@@ -198,7 +198,7 @@ func startServer() {
 
 	// 创建HTTP服务器
 	srv := &http.Server{
-		Addr:         ":" + port,
+		Addr:         os.Getenv("HOST") + ":" + port,
 		Handler:      router,
 		ReadTimeout:  config.AppConfig.HTTPReadTimeout,
 		WriteTimeout: config.AppConfig.HTTPWriteTimeout,
