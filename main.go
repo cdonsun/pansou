@@ -34,6 +34,7 @@ import (
 	_ "pansou/plugin/clmao"
 	_ "pansou/plugin/clxiong"
 	_ "pansou/plugin/cyg"
+	_ "pansou/plugin/dayanzai"
 	_ "pansou/plugin/diduan"
 	_ "pansou/plugin/djgou"
 	_ "pansou/plugin/duanjuw"
@@ -42,6 +43,7 @@ import (
 	_ "pansou/plugin/dygang"
 	_ "pansou/plugin/dyyj"
 	_ "pansou/plugin/dyyjpro"
+	_ "pansou/plugin/guohe"
 
 	// _ "pansou/plugin/erxiao"
 	_ "pansou/plugin/erxiaopan"
