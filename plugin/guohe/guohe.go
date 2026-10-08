@@ -7,6 +7,7 @@ package guohe
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"hash/fnv"
 	"net/http"
@@ -425,6 +426,7 @@ func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{Renegotiation: tls.RenegotiateFreelyAsClient},
 			MaxIdleConns:        httpMaxIdleConns,
 			MaxIdleConnsPerHost: httpMaxIdlePerHost,
 			MaxConnsPerHost:     httpMaxConnsPerHost,

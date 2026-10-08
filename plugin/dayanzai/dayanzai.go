@@ -7,6 +7,7 @@ package dayanzai
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"hash/fnv"
 	"net/http"
@@ -402,6 +403,9 @@ func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
+			// dayanzai.me 的服务器会在 TLS 会话中发起重协商（对 Go 默认客户端
+			// 报 "local error: tls: no renegotiation"），必须显式允许。
+			TLSClientConfig: &tls.Config{Renegotiation: tls.RenegotiateFreelyAsClient},
 			MaxIdleConns:        httpMaxIdleConns,
 			MaxIdleConnsPerHost: httpMaxIdlePerHost,
 			MaxConnsPerHost:     httpMaxConnsPerHost,
