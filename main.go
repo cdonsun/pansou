@@ -69,6 +69,7 @@ import (
 	_ "pansou/plugin/lou1"
 	_ "pansou/plugin/meitizy"
 	_ "pansou/plugin/melost"
+	_ "pansou/plugin/mizixing"
 	_ "pansou/plugin/miosou"
 	_ "pansou/plugin/muou"
 	_ "pansou/plugin/nsgame"
