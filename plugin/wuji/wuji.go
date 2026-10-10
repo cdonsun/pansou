@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/url"
 	"pansou/util"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
+	cloudscraper "github.com/Advik-B/cloudscraper/lib"
 	"github.com/PuerkitoBio/goquery"
 	"pansou/model"
 	"pansou/plugin"
@@ -59,6 +62,10 @@ var userAgents = []string{
 // WujiPlugin 无极磁链搜索插件
 type WujiPlugin struct {
 	*plugin.BaseAsyncPlugin
+
+	scraperOnce  sync.Once
+	scraperClient *http.Client // cloudscraper 内部的 http.Client，带 CF 绕过能力
+	scraperErr   error
 }
 
 // NewWujiPlugin 创建新的无极磁链插件实例
@@ -83,6 +90,34 @@ func (p *WujiPlugin) Description() string {
 	return "ØMagnet 无极磁链 - 磁力链接搜索引擎"
 }
 
+// getScraperClient 懒加载创建 cloudscraper 实例并返回其内部 http.Client。
+// xcili.net 受 Cloudflare 防护，普通 http.Client 会拿到 "Just a moment..." 验证页，
+// 必须用 cloudscraper 自动求解 JS challenge 才能拿到真实页面。
+func (p *WujiPlugin) getScraperClient() (*http.Client, error) {
+	p.scraperOnce.Do(func() {
+		scraper, err := cloudscraper.New()
+		if err != nil {
+			p.scraperErr = fmt.Errorf("[%s] 创建cloudscraper失败: %w", p.Name(), err)
+			return
+		}
+		// cloudscraper 的内部 client 字段未导出，通过反射取出 *http.Client
+		scraperValue := reflect.ValueOf(scraper).Elem()
+		clientField := scraperValue.FieldByName("client")
+		if !clientField.IsValid() || clientField.IsNil() {
+			p.scraperErr = fmt.Errorf("[%s] 未找到cloudscraper内部client", p.Name())
+			return
+		}
+		clientValue := reflect.NewAt(clientField.Type(), unsafe.Pointer(clientField.UnsafeAddr())).Elem()
+		client, ok := clientValue.Interface().(*http.Client)
+		if !ok || client == nil {
+			p.scraperErr = fmt.Errorf("[%s] cloudscraper内部client无效", p.Name())
+			return
+		}
+		p.scraperClient = client
+	})
+	return p.scraperClient, p.scraperErr
+}
+
 // Search 执行搜索并返回结果（兼容性方法）
 func (p *WujiPlugin) Search(keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
 	result, err := p.SearchWithResult(keyword, ext)
@@ -99,6 +134,13 @@ func (p *WujiPlugin) SearchWithResult(keyword string, ext map[string]interface{}
 
 // searchImpl 实际的搜索实现
 func (p *WujiPlugin) searchImpl(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
+	// xcili.net 受 Cloudflare 防护，必须使用 cloudscraper 的 client 才能绕过验证页
+	scraperClient, err := p.getScraperClient()
+	if err != nil {
+		return nil, err
+	}
+	client = scraperClient
+
 	// 1. 首先搜索第一页
 	firstPageResults, err := p.searchPage(client, keyword, 1)
 	if err != nil {
