@@ -56,6 +56,7 @@ import (
 	_ "pansou/plugin/huban"
 	_ "pansou/plugin/hunhepan"
 	_ "pansou/plugin/ikantv"
+	_ "pansou/plugin/javdb"
 	_ "pansou/plugin/jsnoteclub"
 
 	//_ "pansou/plugin/jupansou"
