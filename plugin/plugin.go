@@ -95,6 +95,47 @@ func resolveMainCacheKey(mainCacheKey string, ext map[string]interface{}) string
 	return mainCacheKey
 }
 
+// ExtPrewarmKey 是 ext 中承载"预热请求"标记的键。
+//
+// 预热是后台任务，允许等更久；实时查询不带该标记，等待窗口保持原样。
+// 该键不参与缓存摘要（见 util.ExtDigest），因此预热结果与页面共用同一套缓存。
+const ExtPrewarmKey = "_prewarm"
+
+// IsPrewarm 判断本次请求是否为预热请求。
+// GET 的 ext 走 JSON 解码，数字是 float64；POST 里也可能是 bool/int/string，
+// 这里统一按"真值"宽松判断。
+func IsPrewarm(ext map[string]interface{}) bool {
+	if ext == nil {
+		return false
+	}
+	switch v := ext[ExtPrewarmKey].(type) {
+	case bool:
+		return v
+	case string:
+		return v == "1" || v == "true" || v == "on" || v == "yes"
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	}
+	return false
+}
+
+// responseWait 返回本次请求等待插件结果的时长。
+// 预热请求翻倍，实时请求保持配置值不变。
+func responseWait(ext map[string]interface{}) time.Duration {
+	d := defaultAsyncResponseTimeout
+	if config.AppConfig != nil {
+		d = config.AppConfig.AsyncResponseTimeoutDur
+	}
+	if IsPrewarm(ext) {
+		d *= 2
+	}
+	return d
+}
+
 // ContextFromExt 取出本次搜索的上下文，未设置时返回 background。
 func ContextFromExt(ext map[string]interface{}) context.Context {
 	if ext != nil {
@@ -708,8 +749,14 @@ func (p *BaseAsyncPlugin) AsyncSearch(
 	go func() {
 		// 尝试获取工作槽
 		if !acquireWorkerSlot() {
-			// 工作池已满，使用快速响应客户端直接处理
-			results, err := searchFunc(p.GetClient(), keyword, ext)
+			// 工作池已满，使用快速响应客户端直接处理。
+			// 预热请求改用长超时客户端：它的等待窗口已翻倍，若仍用 4 秒客户端，
+			// 翻倍的窗口只会等来一个已被取消的请求。
+			client := p.GetClient()
+			if IsPrewarm(ext) {
+				client = p.backgroundHTTPClient()
+			}
+			results, err := searchFunc(client, keyword, ext)
 			if err != nil {
 				select {
 				case errorChan <- err:
@@ -850,11 +897,8 @@ func (p *BaseAsyncPlugin) AsyncSearch(
 		}
 	}()
 
-	// 获取响应超时时间
-	responseTimeout := defaultAsyncResponseTimeout
-	if config.AppConfig != nil {
-		responseTimeout = config.AppConfig.AsyncResponseTimeoutDur
-	}
+	// 获取响应超时时间：预热请求翻倍，实时请求保持原值
+	responseTimeout := responseWait(ext)
 
 	// 本次搜索的上下文：由调用方通过 ext 传入，
 	// 批任务超时后据此提前返回，不必等插件自身的响应超时。
@@ -1010,8 +1054,14 @@ func (p *BaseAsyncPlugin) AsyncSearchWithResult(
 
 		// 尝试获取工作槽
 		if !acquireWorkerSlot() {
-			// 工作池已满，使用快速响应客户端直接处理
-			results, err := searchFunc(p.GetClient(), keyword, ext)
+			// 工作池已满，使用快速响应客户端直接处理。
+			// 预热请求改用长超时客户端：它的等待窗口已翻倍，若仍用 4 秒客户端，
+			// 翻倍的窗口只会等来一个已被取消的请求。
+			client := p.GetClient()
+			if IsPrewarm(ext) {
+				client = p.backgroundHTTPClient()
+			}
+			results, err := searchFunc(client, keyword, ext)
 			if err != nil {
 				select {
 				case errorChan <- err:
@@ -1043,11 +1093,8 @@ func (p *BaseAsyncPlugin) AsyncSearchWithResult(
 		}
 	}()
 
-	// 等待结果或超时
-	responseTimeout := defaultAsyncResponseTimeout
-	if config.AppConfig != nil {
-		responseTimeout = config.AppConfig.AsyncResponseTimeoutDur
-	}
+	// 等待结果或超时：预热请求翻倍，实时请求保持原值
+	responseTimeout := responseWait(ext)
 
 	// 本次搜索的上下文：由调用方通过 ext 传入，
 	// 批任务超时后据此提前返回，不必等插件自身的响应超时。

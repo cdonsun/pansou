@@ -31,10 +31,11 @@ import (
 //
 // 判定依据是"能否拿到 HTTP 响应"而不是状态码：404 同样证明网络通，只有传输层失败才算不可达。
 const (
-	// 单次探测的总预算。取值仍明显小于 TGChannelRequestTimeout（默认 4 秒）才有意义：
-	// 实测经本地 socks5 代理访问 t.me 的握手+响应头偶尔会超过 1.5 秒，预算太紧会把
-	// "慢但可用"误判成"不可达"，所以放到 3 秒。探测在后台跑，预算不影响请求时延。
-	tgProbeBudget = 3 * time.Second
+	// 单次探测的总预算。取值仍明显小于 TGChannelRequestTimeout（默认 8 秒）才有意义：
+	// 实测经本地 socks5 代理访问 t.me 的握手+响应头偶尔会超过 1.5 秒；插件并发抢带宽时
+	// 还会更慢，3 秒会把"慢但可用"误判成"不可达"，整轮跳过 TG。放到 5 秒后，
+	// 探测仍在后台跑，不影响请求时延。t.me 真被墙时是建连失败，1~2 秒内就能得出结论。
+	tgProbeBudget = 5 * time.Second
 	// 可达结论的保鲜期：可达时没必要频繁探测。
 	tgReachableTTL = 5 * time.Minute
 	// 不可达结论的保鲜期：故意取短，t.me 恢复后一分钟内自动回到正常路径。
@@ -222,7 +223,7 @@ func tgProbeURL() string {
 // （DNS、连接、TLS、超时）才算不可达。因此即使某个站点不支持 HEAD 而回 405，结论依然正确。
 func probeTGURL(ctx context.Context, client *http.Client, target string) (bool, string) {
 	if client == nil {
-		client = util.GetHTTPClient()
+		client = util.GetTGHTTPClient()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target, nil)
 	if err != nil {

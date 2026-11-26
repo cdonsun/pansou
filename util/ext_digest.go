@@ -25,6 +25,9 @@ var extDigestExcludedKeys = map[string]bool{
 	// service 层注入的主缓存键。它是"结果写到哪"的地址而不是结果形状参数，
 	// 且其值本身由 keyword+plugins+ext 推出，算进摘要纯属冗余。
 	"_main_cache_key": true,
+	// 预热标记只决定"等多久"，不改变结果形状；算进摘要会另开一套缓存槽，
+	// 导致预热写进去的结果页面读不到。
+	"_prewarm": true,
 }
 
 // ExtDigest 计算影响搜索结果形状的 ext 参数的摘要。

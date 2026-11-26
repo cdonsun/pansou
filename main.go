@@ -100,6 +100,7 @@ import (
 	_ "pansou/plugin/woniu"
 	_ "pansou/plugin/xb6v"
 	_ "pansou/plugin/xdpan"
+	_ "pansou/plugin/xgsp"
 	_ "pansou/plugin/xiaokupan"
 	_ "pansou/plugin/xiaoyu"
 	_ "pansou/plugin/xiaozhang"

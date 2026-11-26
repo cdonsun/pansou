@@ -61,6 +61,14 @@ type Config struct {
 	TGChannelRequestTimeout time.Duration // 单个频道请求超时
 	TGResponseMaxBytes      int64         // 单个频道响应体上限
 	TGBackfillEnabled       bool          // 超时后是否后台补齐缺失频道
+	// TGMaxConnsPerHost TG 抓取时每个主机的最大连接数。
+	// TG 一轮要请求 111 个同主机页面，放开成上百条连接会把预算全耗在 TCP+TLS 握手上；
+	// 压小后由 HTTP/2 在少量连接上复用（t.me 已确认 ALPN 协商 h2）。
+	TGMaxConnsPerHost int
+	// TGIPFamily TG 拨号的地址族偏好：v4（默认，失败回落双栈）/auto。
+	// 生产实测同一台机器访问 t.me：IPv4 20/20 成功，IPv6 只有 13/20，
+	// 失败集中在建连阶段（SYN 无响应），因此默认优先 IPv4。
+	TGIPFamily string
 	// CachePartialTTLMinutes 已不再参与 TTL 选择（2026-09-25 起）。
 	//
 	// 它曾用于"本轮有超时则写短 TTL"的分档，但那个门槛在实际部署里判错了对象：
@@ -140,6 +148,8 @@ func Init() {
 		TGChannelRequestTimeout: time.Duration(getTGChannelRequestTimeout()) * time.Second,
 		TGResponseMaxBytes:      getTGResponseMaxBytes(),
 		TGBackfillEnabled:       getTGBackfillEnabled(),
+		TGMaxConnsPerHost:       getTGMaxConnsPerHost(),
+		TGIPFamily:              getTGIPFamily(),
 		CachePartialTTLMinutes:  getCachePartialTTL(),
 		// 插件批任务配置
 		PluginBatchTimeout:     time.Duration(getPluginBatchTimeout()) * time.Second,
@@ -332,7 +342,7 @@ func getCacheTTL() int {
 
 // 从环境变量获取TG频道批任务的软截止时间（秒），默认0表示跟随单频道请求超时。
 //
-// 每个频道请求自带 TG_CHANNEL_REQUEST_TIMEOUT_SECONDS（默认4秒）上限，
+// 每个频道请求自带 TG_CHANNEL_REQUEST_TIMEOUT_SECONDS（默认8秒）上限，
 // 批收集在最后一个请求结束时返回，所以"跟随单请求超时"就等于项目原有的实际行为，
 // 不会主动收紧预算。只有在本地实测过"提前返回不丢结果"之后，才用这个变量收紧。
 func getTGChannelTimeout() int {
@@ -347,17 +357,49 @@ func getTGChannelTimeout() int {
 	return timeout
 }
 
-// 从环境变量获取单个TG频道请求的超时时间（秒），默认4秒。
+// 从环境变量获取单个TG频道请求的超时时间（秒），默认8秒。
+//
+// 4 秒的历史值来自"首页可以秒开"的假设，但生产实测（2026-11-25）：一轮 111 个频道、
+// 每页 gzip 后约 22KB，8 条连接复用 HTTP/2 时全部完成需要 5 秒左右；4 秒下每轮
+// 只有 18~58 个频道能返回，其余全部记成"超时未完成"，日志稳定 `成功 0/111`。
 func getTGChannelRequestTimeout() int {
 	timeoutEnv := os.Getenv("TG_CHANNEL_REQUEST_TIMEOUT_SECONDS")
 	if timeoutEnv == "" {
-		return 4
+		return 8
 	}
 	timeout, err := strconv.Atoi(timeoutEnv)
 	if err != nil || timeout <= 0 {
-		return 4
+		return 8
 	}
 	return timeout
+}
+
+// 从环境变量获取TG抓取每个主机的最大连接数，默认8。
+//
+// 默认传输层给的是 100 条：111 个频道会同时新建 111 条 TCP+TLS 连接，
+// 握手与慢启动把 4~8 秒预算吃光（实测 4 秒预算下仅 18~58/111 完成）。
+// 压到 8 条后由 HTTP/2 复用：同样预算下 108/111，8 秒预算下 111/111。
+func getTGMaxConnsPerHost() int {
+	env := os.Getenv("TG_MAX_CONNS_PER_HOST")
+	if env == "" {
+		return 8
+	}
+	n, err := strconv.Atoi(env)
+	if err != nil || n <= 0 {
+		return 8
+	}
+	return n
+}
+
+// 从环境变量获取TG拨号的地址族偏好，默认v4（先 IPv4，失败回落双栈）。
+// 取值：v4 / auto。生产实测到 t.me 的 IPv6 建连约 35% 无响应，IPv4 20/20 成功。
+func getTGIPFamily() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TG_IP_FAMILY"))) {
+	case "auto", "dual", "any":
+		return "auto"
+	default:
+		return "v4"
+	}
 }
 
 // 从环境变量获取单个TG频道响应体上限（字节），默认2MB。

@@ -265,7 +265,10 @@ func keyPrefix(key string) string {
 // 后台补齐，TG 侧是因为这一轮有频道超时未回。直接覆盖会把此前累积的结果丢掉，而且静默。
 //
 // sender 只用于日志前缀（"主程序"/"频道路径"）；缓存键由调用方给，两条路径各自一套键空间。
-func writeSearchCacheByCompleteness(outcome *batchSearchOutcome, cacheKey string, results []model.SearchResult, sender string) {
+//
+// forceShortTTL 用于"插件批次本轮零成功"的情形：此时 TG 写进去的是一份缺插件结果
+// （对本站来说就是缺在线视频）的条目，不能按完整 TTL 锁住。
+func writeSearchCacheByCompleteness(outcome *batchSearchOutcome, cacheKey string, results []model.SearchResult, sender string, forceShortTTL bool) {
 	if !cacheInitialized || config.AppConfig == nil || !config.AppConfig.CacheEnabled {
 		return
 	}
@@ -279,6 +282,9 @@ func writeSearchCacheByCompleteness(outcome *batchSearchOutcome, cacheKey string
 	if !write {
 		return
 	}
+	if forceShortTTL {
+		ttl = pluginZeroCacheTTL
+	}
 
 	go func(res []model.SearchResult, cacheTTL time.Duration) {
 		written := writeFinalMainCache(enhancedTwoLevelCache, cacheKey, res, cacheTTL)
@@ -287,6 +293,66 @@ func writeSearchCacheByCompleteness(outcome *batchSearchOutcome, cacheKey string
 				sender, cacheKey, len(res), written, cacheTTL.Minutes())
 		}
 	}(results, ttl)
+}
+
+// pluginZeroCacheTTL 插件批次整轮零成功时，主缓存只保留 5 分钟。
+//
+// 起因（2026-11-14 生产实测）：出口并发闸把并发压到 8 时，74 个插件在 10 秒批截止内
+// 几乎全部"没轮到"（日志 `xgsp:0s/0s`、`成功 0/74`），插件路径按规则不写缓存；但同关键词
+// 的 TG 阶段正常返回，按完整 TTL 写了 60 分钟。于是"没有在线视频"的结论被锁一小时，
+// 之后每次搜索都命中这份缓存、插件根本不会再跑。给它一个短 TTL，让下一次重搜能补齐。
+const pluginZeroCacheTTL = 5 * time.Minute
+
+// pluginZeroRounds 记录"本轮插件批次零成功"的关键词，供并行执行的 TG 路径在写缓存时
+// 选择短 TTL。按关键词而不是缓存键记录：两条路径各自一套键空间，用键对不上。
+// 这里只是尽力而为的提示：插件路径结束时还会把已存在的条目就地降级
+// （见 downgradeMainCacheTTL），两者合起来覆盖先后顺序。
+var pluginZeroRounds sync.Map // string -> time.Time
+
+func pluginZeroRoundKey(keyword string) string {
+	return strings.ToLower(strings.TrimSpace(keyword))
+}
+
+func markPluginZeroRound(keyword string) {
+	pluginZeroRounds.Store(pluginZeroRoundKey(keyword), time.Now())
+}
+
+func pluginZeroRoundActive(keyword string) bool {
+	v, ok := pluginZeroRounds.Load(pluginZeroRoundKey(keyword))
+	if !ok {
+		return false
+	}
+	ts, ok := v.(time.Time)
+	if !ok || time.Since(ts) > 2*pluginZeroCacheTTL {
+		pluginZeroRounds.Delete(pluginZeroRoundKey(keyword))
+		return false
+	}
+	return true
+}
+
+// downgradeMainCacheTTL 把已有主缓存条目的 TTL 改写为 d，数据本身不动。
+//
+// 用于"本轮插件没跑到、TG 已经把无插件结果按完整 TTL 写进去"的场景：不删数据，
+// 只让它在几分钟后自然过期，下一次搜索重新跑插件。写完仍走按键互斥，避免与
+// writeFinalMainCache 的读-改-写互相覆盖。
+func downgradeMainCacheTTL(cacheKey string, d time.Duration) {
+	if !cacheInitialized || config.AppConfig == nil || !config.AppConfig.CacheEnabled || enhancedTwoLevelCache == nil {
+		return
+	}
+	unlock := lockMainCacheKey(cacheKey)
+	defer unlock()
+
+	data, hit, err := enhancedTwoLevelCache.Get(cacheKey)
+	if err != nil || !hit || len(data) == 0 {
+		return
+	}
+	if err := enhancedTwoLevelCache.SetBothLevels(cacheKey, data, d); err != nil {
+		fmt.Printf("[主程序] 缓存降级失败: %s | 错误: %v\n", cacheKey, err)
+		return
+	}
+	if config.AppConfig.AsyncLogEnabled {
+		fmt.Printf("[主程序] 插件本轮零成功，主缓存降级为短 TTL: %s | %.0f分钟\n", cacheKey, d.Minutes())
+	}
 }
 
 // writeFinalMainCache 写入一次搜索的最终结果到主缓存。
@@ -554,7 +620,8 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tgResults, tgErr = s.searchTG(keyword, channels, forceRefresh)
+			// 预热请求（ext 带 _prewarm）把 TG 等待窗口也翻倍
+			tgResults, tgErr = s.searchTG(keyword, channels, forceRefresh, plugin.IsPrewarm(ext))
 		}()
 	}
 	// 如果需要搜索插件（且插件功能已启用）
@@ -699,23 +766,28 @@ func getKeywordPriority(title string) int {
 
 // 搜索单个频道
 func (s *SearchService) searchChannel(keyword string, channel string) ([]model.SearchResult, error) {
-	return s.searchChannelWithContext(context.Background(), keyword, channel)
+	return s.searchChannelWithContext(context.Background(), keyword, channel, false)
 }
 
 // searchChannelWithContext 在调用方上下文内搜索单个频道。
 // 频道请求自身的超时保留（可通过 TG_CHANNEL_REQUEST_TIMEOUT_SECONDS 调整），
 // 同时受父上下文的取消约束；非 200 状态码直接判为失败，不会把错误页
 // 当成"频道没有匹配内容"；响应体有大小上限，避免异常响应把内存吃满。
-func (s *SearchService) searchChannelWithContext(parent context.Context, keyword string, channel string) ([]model.SearchResult, error) {
+func (s *SearchService) searchChannelWithContext(parent context.Context, keyword string, channel string, prewarm bool) ([]model.SearchResult, error) {
 	// 构建搜索URL
 	searchURL := util.BuildSearchURL(channel, keyword, "")
 
-	// 使用全局HTTP客户端（已配置代理）
-	client := util.GetHTTPClient()
+	// 使用 TG 专用客户端：每主机 8 条连接（HTTP/2 复用）+ 优先 IPv4。
+	// 共享客户端是 100 条连接，111 个同主机请求会同时握手，预算全被握手吃掉。
+	client := util.GetTGHTTPClient()
 
 	requestTimeout := config.AppConfig.TGChannelRequestTimeout
 	if requestTimeout <= 0 {
-		requestTimeout = 4 * time.Second
+		requestTimeout = 8 * time.Second
+	}
+	// 预热请求翻倍：实时查询不受影响
+	if prewarm {
+		requestTimeout *= 2
 	}
 	// WithTimeout 会取父上下文与本次超时的较小者，天然满足 deadline 传播，
 	// 批任务软截止一到就不会有请求继续占着上游连接。
@@ -1274,6 +1346,7 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 				Datetime: linkDatetime,
 				Source:   source,        // 添加数据来源字段
 				Images:   result.Images, // 添加TG消息中的图片链接
+				Player:   link.Player,   // 在线视频播放参数（随结果下发并进入缓存）
 			}
 
 			// 检查是否已存在相同URL的链接
@@ -1361,7 +1434,7 @@ type tgChannelResult struct {
 }
 
 // searchTG 搜索TG频道
-func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh bool) ([]model.SearchResult, error) {
+func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh bool, prewarm bool) ([]model.SearchResult, error) {
 	// 生成缓存键
 	cacheKey := cache.GenerateTGCacheKey(keyword, channels)
 
@@ -1405,7 +1478,7 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 		ch := channel // 创建副本，避免闭包问题
 		tasks = append(tasks, func(ctx context.Context) interface{} {
 			start := time.Now()
-			channelResults, err := s.searchChannelWithContext(ctx, keyword, ch)
+			channelResults, err := s.searchChannelWithContext(ctx, keyword, ch, prewarm)
 			return &tgChannelResult{channel: ch, results: channelResults, err: err, duration: time.Since(start)}
 		})
 	}
@@ -1417,7 +1490,11 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 		batchTimeout = config.AppConfig.TGChannelRequestTimeout
 	}
 	if batchTimeout <= 0 {
-		batchTimeout = 4 * time.Second
+		batchTimeout = 8 * time.Second
+	}
+	// 预热请求翻倍：实时查询不受影响
+	if prewarm {
+		batchTimeout *= 2
 	}
 	taskResults := pool.ExecuteBatchWithTimeout(tasks, len(channels), batchTimeout)
 
@@ -1442,10 +1519,13 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 
 	// 缓存写入按完整度分流：全失败不写、有超时写短TTL、其余写正常TTL。
 	// 与插件路径共用同一个实现——两条路径各写一份时已经漂移过（见函数注释）。
-	writeSearchCacheByCompleteness(outcome, cacheKey, results, "频道路径")
+	// 若插件批次已在同一本轮里宣告零成功，这份只有 TG 结果的条目改用短 TTL。
+	writeSearchCacheByCompleteness(outcome, cacheKey, results, "频道路径", pluginZeroRoundActive(keyword))
 
-	// 后台补齐超时未完成的频道，用完整结果覆盖缓存
-	if outcome.shouldBackfill(config.AppConfig.TGBackfillEnabled) &&
+	// 后台补齐超时未完成的频道，用完整结果覆盖缓存。
+	// 频道路径不套用插件的"缺失超过三分之一就不补"门槛（见 shouldBackfillTG）：
+	// 111 个频道压在 8 条复用连接上，补齐代价有上界，而残缺结果会被缓存 60 分钟。
+	if outcome.shouldBackfillTG(config.AppConfig.TGBackfillEnabled) &&
 		cacheInitialized && config.AppConfig.CacheEnabled {
 		go s.backfillTGChannels(cacheKey, keyword, outcome.missingIDs(), len(channels), results)
 	}
@@ -1453,23 +1533,23 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 	return results, nil
 }
 
+// tgBackfillBatchBudget 是频道后台补齐批次的总预算。
+// 单频道请求仍受 TGChannelRequestTimeout（默认 8 秒）约束，这里只负责"等多久收摊"。
+const tgBackfillBatchBudget = 20 * time.Second
+
 // backfillTGChannels 在后台补搜批任务超时未返回的频道，并把合并后的完整结果写入缓存。
-// 触发条件（缺失比例、开关）由 batchSearchOutcome.shouldBackfill 统一判断。
+// 触发条件（缺失比例、开关）由 batchSearchOutcome.shouldBackfillTG 统一判断。
 func (s *SearchService) backfillTGChannels(cacheKey, keyword string, missing []string, total int, collected []model.SearchResult) {
 	if len(missing) == 0 {
 		return
-	}
-
-	requestTimeout := config.AppConfig.TGChannelRequestTimeout
-	if requestTimeout <= 0 {
-		requestTimeout = 4 * time.Second
 	}
 
 	tasks := make([]pool.Task, 0, len(missing))
 	for _, channel := range missing {
 		ch := channel
 		tasks = append(tasks, func(ctx context.Context) interface{} {
-			channelResults, err := s.searchChannelWithContext(ctx, keyword, ch)
+			// 后台补齐发生在响应之后，用常规窗口即可（预热请求同样不需要加长）
+			channelResults, err := s.searchChannelWithContext(ctx, keyword, ch, false)
 			if err != nil {
 				return nil
 			}
@@ -1478,7 +1558,11 @@ func (s *SearchService) backfillTGChannels(cacheKey, keyword string, missing []s
 	}
 
 	// 补齐批次也有自己的预算，到点没回来的频道就放弃，不再叠加等待。
-	backfillResults := pool.ExecuteBatchWithTimeout(tasks, len(missing), requestTimeout)
+	//
+	// 这里给的是后台预算，不占用首屏时延，所以比单频道超时宽：
+	// 生产实测 111 个频道单独跑完约需 5~6 秒，但插件流量还在收尾时要更久；
+	// 用 8 秒会和主请求一样把一半频道砍掉，补齐全员失败就失去意义。
+	backfillResults := pool.ExecuteBatchWithTimeout(tasks, len(missing), tgBackfillBatchBudget)
 
 	merged := make([]model.SearchResult, 0, len(collected))
 	merged = append(merged, collected...)
@@ -1677,10 +1761,15 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 	// 截止不再拍固定秒数，改为按波次推导：ceil(任务数/有效并发) × 每任务 p90 + 余量。
 	// 显式设置 PLUGIN_BATCH_TIMEOUT_SECONDS 时以它为准（部署方的显式意图优先于公式），
 	// 上限仍取 PLUGIN_TIMEOUT，避免公式把等待拉得比长超时还长。
+	// 预热请求（ext 带 _prewarm）把显式覆盖与上限一起翻倍；实时查询保持原值。
 	var override, cap time.Duration
 	if config.AppConfig != nil {
 		override = config.AppConfig.PluginBatchTimeout
 		cap = config.AppConfig.PluginTimeout
+	}
+	if plugin.IsPrewarm(ext) {
+		override *= 2
+		cap *= 2
 	}
 	perTaskP90, sampleCount := tracker.aggregateP90()
 	batchTimeout := deriveBatchDeadline(len(tasks), concurrency, perTaskP90, override, cap)
@@ -1756,7 +1845,13 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 	// 缓存写入按完整度分流，与频道路径同一套判定：
 	// 全失败不写、有插件超时写短TTL、其余写正常TTL。
 	// 缓存写入按完整度分流，与频道路径同一套判定——同一个实现，不再各写一份。
-	writeSearchCacheByCompleteness(outcome, cacheKey, allResults, "主程序")
+	// 本轮整批零成功（多为出口闸没轮到）：插件侧不写，但要把 TG 刚按完整 TTL
+	// 写进去的"无插件结果"条目降级为短 TTL，否则缺在线视频会持续一整个周期。
+	if outcome.succeeded == 0 {
+		markPluginZeroRound(keyword)
+		downgradeMainCacheTTL(cacheKey, pluginZeroCacheTTL)
+	}
+	writeSearchCacheByCompleteness(outcome, cacheKey, allResults, "主程序", false)
 
 	// 后台补齐超时未返回的插件，用完整结果覆盖缓存
 	if outcome.shouldBackfill(config.AppConfig.PluginBackfillEnabled) &&

@@ -4,11 +4,34 @@ import "time"
 
 // Link 网盘链接
 type Link struct {
-	Type      string    `json:"type" sonic:"type"`
-	URL       string    `json:"url" sonic:"url"`
-	Password  string    `json:"password" sonic:"password"`
-	Datetime  time.Time `json:"datetime,omitempty" sonic:"datetime,omitempty"`     // 链接更新时间（可选）
-	WorkTitle string    `json:"work_title,omitempty" sonic:"work_title,omitempty"` // 作品标题（用于区分同一消息中多个作品的链接）
+	Type      string      `json:"type" sonic:"type"`
+	URL       string      `json:"url" sonic:"url"`
+	Password  string      `json:"password" sonic:"password"`
+	Datetime  time.Time   `json:"datetime,omitempty" sonic:"datetime,omitempty"`     // 链接更新时间（可选）
+	WorkTitle string      `json:"work_title,omitempty" sonic:"work_title,omitempty"` // 作品标题（用于区分同一消息中多个作品的链接）
+	Player    *LinkPlayer `json:"player,omitempty" sonic:"player,omitempty"`         // 在线视频播放参数（线路/选集），随结果下发，避免播放时二次回源
+}
+
+// LinkPlayer 在线视频播放参数（仅元数据，媒体流仍在第三方 CDN）
+type LinkPlayer struct {
+	ID        int                `json:"id" sonic:"id"`
+	Title     string             `json:"title,omitempty" sonic:"title,omitempty"`
+	Poster    string             `json:"poster,omitempty" sonic:"poster,omitempty"`
+	UpdatedAt string             `json:"updated_at,omitempty" sonic:"updated_at,omitempty"`
+	Sources   []LinkPlayerSource `json:"sources" sonic:"sources"`
+}
+
+// LinkPlayerSource 播放线路
+type LinkPlayerSource struct {
+	Flag     string              `json:"flag" sonic:"flag"`
+	Episodes []LinkPlayerEpisode `json:"episodes" sonic:"episodes"`
+}
+
+// LinkPlayerEpisode 单集播放地址
+type LinkPlayerEpisode struct {
+	Name string `json:"name" sonic:"name"`
+	URL  string `json:"url" sonic:"url"`
+	Kind string `json:"kind" sonic:"kind"` // hls / video / page
 }
 
 // SearchResult 搜索结果
@@ -26,12 +49,13 @@ type SearchResult struct {
 
 // MergedLink 合并后的网盘链接
 type MergedLink struct {
-	URL      string    `json:"url" sonic:"url"`
-	Password string    `json:"password" sonic:"password"`
-	Note     string    `json:"note" sonic:"note"`
-	Datetime time.Time `json:"datetime" sonic:"datetime"`
-	Source   string    `json:"source,omitempty" sonic:"source,omitempty"` // 数据来源：tg:频道名 或 plugin:插件名
-	Images   []string  `json:"images,omitempty" sonic:"images,omitempty"` // TG消息中的图片链接
+	URL      string      `json:"url" sonic:"url"`
+	Password string      `json:"password" sonic:"password"`
+	Note     string      `json:"note" sonic:"note"`
+	Datetime time.Time   `json:"datetime" sonic:"datetime"`
+	Source   string      `json:"source,omitempty" sonic:"source,omitempty"` // 数据来源：tg:频道名 或 plugin:插件名
+	Images   []string    `json:"images,omitempty" sonic:"images,omitempty"` // TG消息中的图片链接
+	Player   *LinkPlayer `json:"player,omitempty" sonic:"player,omitempty"` // 在线视频播放参数（仅 video 类型）
 }
 
 // MergedLinks 按网盘类型分组的合并链接

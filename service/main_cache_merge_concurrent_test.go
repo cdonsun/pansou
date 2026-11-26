@@ -249,7 +249,7 @@ func TestWriteSearchCacheByCompletenessMergesForBGothPaths(t *testing.T) {
 		outcome := newBatchSearchOutcome(3)
 		outcome.observe("a", nil, time.Millisecond) // 一个成功、两个超时 -> 走短 TTL 且照写
 		outcome.finalize([]string{"a", "b", "c"})
-		writeSearchCacheByCompleteness(outcome, key, []model.SearchResult{{UniqueID: "本轮-0", Title: "本轮唯一"}}, "测试")
+		writeSearchCacheByCompleteness(outcome, key, []model.SearchResult{{UniqueID: "本轮-0", Title: "本轮唯一"}}, "测试", false)
 
 		// 写是放在 goroutine 里的，等它落盘
 		deadline := time.Now().Add(2 * time.Second)

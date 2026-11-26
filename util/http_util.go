@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -15,6 +16,9 @@ import (
 
 // 全局HTTP客户端
 var httpClient *http.Client
+
+// TG 频道抓取专用客户端（连接数与拨号策略都与其他上游不同，见 GetTGHTTPClient）
+var tgHTTPClient *http.Client
 
 // InitHTTPClient 初始化HTTP客户端
 func InitHTTPClient() {
@@ -115,12 +119,28 @@ func describeProxy(rawProxyURL string) string {
 
 // NewHTTPClient 创建HTTP客户端，可按需指定本客户端使用的代理。
 func NewHTTPClient(proxyURL string) (*http.Client, error) {
+	return newHTTPClient(proxyURL, 100, nil)
+}
+
+// newHTTPClient 是共享客户端与 TG 专用客户端的共同构造入口。
+// maxConnsPerHost 为 0 时沿用 100（历史行为）；dial 为 nil 时使用标准双栈拨号。
+func newHTTPClient(proxyURL string, maxConnsPerHost int, dial func(context.Context, string, string) (net.Conn, error)) (*http.Client, error) {
 	// 连接池配置：空闲连接保活时间直接影响"快速兜底"这类密集访问路径的
 	// 冷启动成本——连接一旦被回收，下次搜索要多付一次 TCP+TLS 握手。
 	maxIdleConnsPerHost, idleConnTimeout := upstreamPoolSettings()
+	if maxConnsPerHost <= 0 {
+		maxConnsPerHost = 100
+	}
 	maxIdleConns := 100
 	if maxIdleConns < maxIdleConnsPerHost {
 		maxIdleConns = maxIdleConnsPerHost
+	}
+
+	if dial == nil {
+		dial = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
 	}
 
 	// 创建传输配置
@@ -136,17 +156,13 @@ func NewHTTPClient(proxyURL string) (*http.Client, error) {
 		// 连接池优化
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		MaxConnsPerHost:       100,
+		MaxConnsPerHost:       maxConnsPerHost,
 		IdleConnTimeout:       idleConnTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 
 		// TCP连接优化
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}).DialContext,
+		DialContext: dial,
 	}
 
 	if err := applyProxyFunc(transport, proxyURL); err != nil {
@@ -160,6 +176,77 @@ func NewHTTPClient(proxyURL string) (*http.Client, error) {
 	}
 
 	return client, nil
+}
+
+// GetTGHTTPClient 返回 TG 频道抓取专用客户端。
+//
+// 与共享客户端只有两点不同，都是针对 t.me 的实测结论（2026-11-25，生产机：
+// 111 个频道 × 每页 gzip 后约 22KB）：
+//
+//  1. **每主机连接数压到 8**。共享客户端是 100 条，111 个频道会同时新建上百条
+//     TCP+TLS 连接；4 秒预算下只有 18~58/111 能完成，其余全部挂到超时，
+//     日志就是 `[searchTG] 成功 0/111，超时未完成 108`。t.me 已确认 ALPN 协商 h2，
+//     8 条连接足以复用全部请求：同样 4 秒预算下 108/111，8 秒预算下 111/111。
+//  2. **优先 IPv4 拨号**。同一台机器上 IPv4 访问 t.me 20/20 成功，IPv6 只有 13/20，
+//     失败都是建连阶段无响应（`read tcp [2404:...]`、connect 0.000s）。默认先走
+//     IPv4，2 秒内没连上再回落双栈，IPv6 仍然保留为可用路径，纯 IPv6 环境不受影响。
+func GetTGHTTPClient() *http.Client {
+	if tgHTTPClient != nil {
+		return tgHTTPClient
+	}
+	proxyURL := ""
+	family := "v4"
+	maxConns := 8
+	if config.AppConfig != nil {
+		proxyURL = config.AppConfig.ProxyURL
+		if config.AppConfig.TGMaxConnsPerHost > 0 {
+			maxConns = config.AppConfig.TGMaxConnsPerHost
+		}
+		if config.AppConfig.TGIPFamily != "" {
+			family = config.AppConfig.TGIPFamily
+		}
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	var dial func(context.Context, string, string) (net.Conn, error) = dialer.DialContext
+	if family != "auto" {
+		dial = preferIPv4Dial(dialer)
+	}
+
+	client, err := newHTTPClient(proxyURL, maxConns, dial)
+	if err != nil {
+		// 代理配置不合法时退回不带代理的 TG 客户端，保持与 InitHTTPClient 一致的兜底。
+		client, _ = newHTTPClient("", maxConns, dial)
+	}
+	tgHTTPClient = client
+	return tgHTTPClient
+}
+
+// tgIPv4AttemptBudget 是"先 IPv4"策略里单次 IPv4 建连的预算。
+// 超过它就放弃 IPv4、回落到双栈，避免 IPv4 被静默丢包时把整轮预算耗死。
+// 实测到 t.me 的正常建连约 0.2 秒，2 秒足够覆盖抖动。
+const tgIPv4AttemptBudget = 2 * time.Second
+
+// preferIPv4Dial 返回一个优先 IPv4 的拨号函数：先只拨 tcp4，成功就直接用；
+// 失败（含目标只有 AAAA 记录）或超过 tgIPv4AttemptBudget 时回落到双栈，
+// IPv6 仍然保留为可用路径，纯 IPv6 环境不受影响。
+func preferIPv4Dial(d *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network != "tcp" && network != "tcp4" {
+			return d.DialContext(ctx, network, addr)
+		}
+
+		ctx4, cancel4 := context.WithTimeout(ctx, tgIPv4AttemptBudget)
+		conn, err := d.DialContext(ctx4, "tcp4", addr)
+		cancel4()
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return d.DialContext(ctx, "tcp", addr)
+	}
 }
 
 // BuildProxyFunc 构造统一的代理解析函数。

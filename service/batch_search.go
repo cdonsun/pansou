@@ -310,6 +310,22 @@ func (o *batchSearchOutcome) shouldBackfill(enabled bool) bool {
 	return o.timedOut()*3 <= o.total
 }
 
+// shouldBackfillTG 是频道路径专用的补齐判定，刻意不套用插件的三分之一门槛。
+//
+// 频道表是固定的 111 个，批任务压在 8 条复用连接上（见 util.GetTGHTTPClient），
+// 补齐一轮最多再跑一次 111 个频道，代价有上界；而"只回 7/111"对用户就是一屏空结果。
+// 生产实测（2026-11-25）：插件并发抢带宽时，8 秒窗口内频道只能回来 7~16 个，
+// 按三分之一门槛正好被判成"不值得补"，于是残缺结果被写进 60 分钟缓存。
+// 这里改成"只要本轮有频道没回来就补"，由 in-flight 去重和固定 8 条连接兜住负载。
+func (o *batchSearchOutcome) shouldBackfillTG(enabled bool) bool {
+	if !enabled || o.total == 0 || o.timedOut() == 0 {
+		return false
+	}
+	// 一个都没回来时不补：此时多半是门（可达性）或出口整体故障，
+	// 再发一轮只会加倍压向已经不可用的链路；等下一轮搜索自然重试。
+	return o.succeeded > 0
+}
+
 // logSummary 输出完整度摘要与慢项明细，便于判断这次是"慢"还是"坏"。
 // 只在存在失败或超时未完成时输出，正常批次不产生噪音。
 func (o *batchSearchOutcome) logSummary(source, keyword string) {
