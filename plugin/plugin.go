@@ -1041,16 +1041,14 @@ func (p *BaseAsyncPlugin) AsyncSearchWithResult(
 	resultChan := make(chan []model.SearchResult, 1)
 	errorChan := make(chan error, 1)
 	doneChan := make(chan struct{})
+	// doneChan 会被前台 worker 与后台补齐协程同时收尾，用 Once 保证只 close 一次
+	// （原来的 select 判空再 close 存在竞态，曾导致 "close of closed channel" panic）
+	var doneOnce sync.Once
+	closeDone := func() { doneOnce.Do(func() { close(doneChan) }) }
 
 	// 启动后台处理
 	go func() {
-		defer func() {
-			select {
-			case <-doneChan:
-			default:
-				close(doneChan)
-			}
-		}()
+		defer closeDone()
 
 		// 尝试获取工作槽
 		if !acquireWorkerSlot() {
@@ -1103,7 +1101,7 @@ func (p *BaseAsyncPlugin) AsyncSearchWithResult(
 	// 超时或调用方取消：返回空结果，后台继续处理并填充缓存
 	pending := func() model.PluginSearchResult {
 		// 🔥 超时处理：返回空结果，后台继续处理
-		go p.completeSearchInBackground(keyword, searchFunc, pluginSpecificCacheKey, mainCacheKey, doneChan, ext)
+		go p.completeSearchInBackground(keyword, searchFunc, pluginSpecificCacheKey, mainCacheKey, closeDone, ext)
 
 		// 存储临时缓存（标记为不完整）
 		apiResponseCache.Store(pluginSpecificCacheKey, cachedResponse{
@@ -1178,16 +1176,10 @@ func (p *BaseAsyncPlugin) completeSearchInBackground(
 	searchFunc func(*http.Client, string, map[string]interface{}) ([]model.SearchResult, error),
 	pluginCacheKey string,
 	mainCacheKey string,
-	doneChan chan struct{},
+	closeDone func(),
 	ext map[string]interface{},
 ) {
-	defer func() {
-		select {
-		case <-doneChan:
-		default:
-			close(doneChan)
-		}
-	}()
+	defer closeDone()
 
 	// 执行完整搜索
 	results, err := searchFunc(p.backgroundHTTPClient(), keyword, ext)
